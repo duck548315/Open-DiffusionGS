@@ -9,6 +9,7 @@ Three backends (priority order when backend="auto"):
 
 import io
 import os
+import time
 import urllib.request
 
 import torch
@@ -25,6 +26,7 @@ def _edit_replicate(
     api_token: str,
     model: str = "black-forest-labs/flux-kontext-dev",
     num_variants: int = 1,
+    max_retries: int = 6,
 ) -> list[Image.Image]:
     import replicate
 
@@ -35,17 +37,33 @@ def _edit_replicate(
 
     results = []
     for _ in range(num_variants):
-        buf.seek(0)
-        output = client.run(model, input={"prompt": prompt, "input_image": buf})
-
-        # output can be a FileOutput, URL string, or list thereof
-        if not isinstance(output, (list, tuple)):
-            output = [output]
-        for item in output:
-            url = item.url if hasattr(item, "url") else str(item)
-            with urllib.request.urlopen(url) as r:
-                results.append(Image.open(io.BytesIO(r.read())).convert("RGB"))
-            break  # one image per variant
+        for attempt in range(max_retries):
+            try:
+                buf.seek(0)
+                output = client.run(model, input={"prompt": prompt, "input_image": buf})
+                if not isinstance(output, (list, tuple)):
+                    output = [output]
+                for item in output:
+                    url = item.url if hasattr(item, "url") else str(item)
+                    with urllib.request.urlopen(url) as r:
+                        results.append(Image.open(io.BytesIO(r.read())).convert("RGB"))
+                    break
+                break  # success — exit retry loop
+            except Exception as e:
+                err = str(e)
+                is_rate_limit = (
+                    "429" in err
+                    or "throttled" in err.lower()
+                    or "rate limit" in err.lower()
+                )
+                is_server_err = "500" in err or "internal server error" in err.lower()
+                if (is_rate_limit or is_server_err) and attempt < max_retries - 1:
+                    wait = 3 if is_server_err else min(5 * (2 ** attempt), 60)
+                    print(f"[Replicate] {'500' if is_server_err else '429'} "
+                          f"(attempt {attempt+1}/{max_retries}), retrying in {wait}s…")
+                    time.sleep(wait)
+                else:
+                    raise
 
     return results or [image]
 

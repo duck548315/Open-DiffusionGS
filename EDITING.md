@@ -1,40 +1,93 @@
-# DiffusionGS — Image to 3D with VLM Style Editing
+# DiffusionGS — Dual-Path Geometry + Color Pipeline
 
-This extension adds text-guided appearance editing to DiffusionGS by inserting an InstructPix2Pix editing stage before 3D reconstruction.
+## Core idea
 
-**Key idea**: 2D image editing models are strong. Single-view 3D generation is strong. Combining them lets a single input photo produce multiple styled 3D objects from different text prompts.
+User gives **one** edit instruction. Internally the system splits it and runs
+two separate image-editing + 3D-reconstruction paths with **interleaved
+geometry injection**:
+
+- **Geometry path** — denoises from a geo-focused edit image; drives xyz / scale / rotation
+- **Color path**    — denoises from a color-focused edit image; at every step
+  its noisy novel views are replaced with renders of the current geo-path
+  Gaussians, so it converges to the same geometry while producing accurate RGB
+
+The final output is the fully-denoised `color_gs` — geometry was already
+guided by geo throughout, so no post-hoc merge is needed.
 
 ---
 
 ## Pipeline
 
 ```
-Input Image
-    │
-    ▼
-[Stage 0]  InstructPix2Pix  (optional)
-    │  instruction prompt → edited image
-    │  Load → edit → unload  (frees VRAM before DiffusionGS)
-    │
-    ▼
-[Stage 1]  DiffusionGS
-    │  edited image → GaussianModel
-    │
-    ▼
-Output
-    ├── output.gif / output.mp4  (turntable)
-    ├── output.ply               (Gaussian splat)
-    └── output.obj               (mesh)
+┌─────────────────────────────────────────────────────────┐
+│  Image mode          │  Text mode                       │
+│  user uploads photo  │  Step 1: user describes object   │
+│                      │    → VLM → t2i prompt            │
+│                      │    → FLUX generates base image   │
+│                      │    → shown to user for review    │
+│                      │  Step 2: user enters edit        │
+└──────────┬───────────┴──────────────┬────────────────────┘
+           │                          │
+           └──────────┬───────────────┘
+                      │  image + edit instruction
+                      ▼
+            ┌─────────────────┐
+            │  Stage 1 — VLM  │  Gemini sees image + instruction
+            │  (multimodal)   │  → geo_edit_prompt
+            └────────┬────────┘  → color_edit_prompt
+                     │
+          ┌──────────┴──────────┐
+          ▼                     ▼
+  Stage 2 — Flux Kontext   Stage 3 — Flux Kontext
+  image + geo_edit          image + color_edit
+  → geo_image               → color_image
+          │                     │
+          └──────────┬──────────┘
+                     ▼
+         Stage 4 — Dual DiffusionGS  (30 steps)
+         ┌──────────────────────────────────────┐
+         │  geo path   ──denoises──▶ geo_gs_t   │
+         │                              │        │
+         │             render 3 views   │        │
+         │                              ▼        │
+         │  color path ◀── inject as image_noisy │
+         │             ──denoises──▶ color_gs_t  │
+         └──────────────────────────────────────┘
+                     │
+                     ▼
+             color_gs  (filtered, output)
+             geometry guided by geo path
+             colors from color path
 ```
 
-### Why edit in 2D first?
+---
 
-VRAM is tight during DiffusionGS denoising — inserting another model into the diffusion loop is not feasible on a single consumer GPU. The staged approach:
+## Code structure
 
-1. Runs InstructPix2Pix, then unloads it completely.
-2. Runs DiffusionGS at fp16 on the edited image.
+```python
+# app.py
+_run_pipeline(pil_image, edit_instruction, ...)   # shared core
+run_image_mode(...)    # np.array → PIL → _run_pipeline
+run_text_step2(...)    # state PIL → _run_pipeline  (identical path)
+generate_base(text)    # text-only Step 1: VLM t2i prompt → FLUX → show to user
 
-The 2D edit is fully absorbed by the 3D reconstruction, so the resulting GaussianModel reflects both the geometry and the appearance of the edited image.
+# diffusionGS/pipline_obj.py
+DGSPipeline.dual_call(geo_image, color_image, ...)
+  # interleaved denoising loop — returns filtered color_gs
+```
+
+---
+
+## Interleaved injection (dual_call)
+
+Every denoising step (including step 0):
+1. Both paths call `p_sample` to get predicted Gaussians
+2. Take geo path's xyz/scaling/rotation/opacity + color path's features
+3. Render 3 novel views via `render_opencv_cam` (cameras must be on GPU —
+   `cam_template` is loaded from disk to CPU, move with `.to(device)`)
+4. Feed those renders as `image_noisy` into color path's next step via `q_sample`
+
+Final output: `color_gs` with `apply_all_filters(opacity_thres=0.02, crop_bbx=[-0.91…0.91])`
 
 ---
 
@@ -42,80 +95,35 @@ The 2D edit is fully absorbed by the 3D reconstruction, so the resulting Gaussia
 
 | File | Description |
 |------|-------------|
-| `diffusionGS/editing/vlm_edit.py` | `edit_image()` — InstructPix2Pix 2D editing |
-| `diffusionGS/editing/visualize.py` | `save_turntable_gif`, `save_turntable_video`, `render_turntable_frames` |
-| `diffusionGS/editing/__init__.py` | Module exports |
-| `edit_3d.py` | CLI entry point |
-| `app.py` | Gradio web demo |
+| `diffusionGS/editing/generate.py` | `decompose_prompt()` — VLM splits one instruction into geo + color edit prompts; `text_to_image()` — FLUX / Gemini |
+| `diffusionGS/editing/merge.py` | `merge_gaussians()` — kept for reference, no longer used in main path |
+| `diffusionGS/editing/vlm_edit.py` | `edit_image()` — Flux Kontext / Gemini / IP2P 2D editing |
+| `diffusionGS/editing/visualize.py` | turntable video / view grid helpers |
+| `diffusionGS/editing/__init__.py` | module exports |
+| `app.py` | Gradio UI — two tabs (image mode / text mode) |
 
 ---
 
-## Usage
+## Backends
 
-### CLI
+| Task | Replicate | Gemini | Local fallback |
+|---|---|---|---|
+| VLM decompose | — | `gemini-2.5-flash` | string augmentation |
+| Text-to-image | `flux-schnell` | `gemini-2.5-flash-image` | — |
+| Image editing | `flux-kontext-dev` | `gemini-2.5-flash-image` | InstructPix2Pix |
 
-```bash
-# Image → 3D only
-python edit_3d.py --image photo.png
-
-# VLM edit → 3D
-python edit_3d.py --image photo.png --vlm_prompt "make it made of gold"
-
-# Multiple styles from one image
-python edit_3d.py --image photo.png --vlm_prompt "make it made of gold" --output_dir out/gold
-python edit_3d.py --image photo.png --vlm_prompt "turn it into marble" --output_dir out/marble
-python edit_3d.py --image photo.png --vlm_prompt "make it look like crystal" --output_dir out/crystal
+`.env` keys:
 ```
-
-### Gradio Demo
-
-```bash
-python app.py
-```
-
-### Python API
-
-```python
-import torch
-from PIL import Image
-from diffusionGS.pipline_obj import DiffusionGSPipeline
-from diffusionGS.editing import edit_image
-
-# Stage 0 — VLM 2D edit
-src = Image.open("photo.png").convert("RGB")
-edited = edit_image(src, prompt="make it made of gold", device="cuda:0")[0]
-
-# Stage 1 — 3D reconstruction
-pipeline = DiffusionGSPipeline.from_pretrained(
-    "CaiYuanhao/DiffusionGS", device="cuda:0", torch_dtype=torch.float16
-)
-gs_output = pipeline(edited, seed=42, extract_mesh=True)
-
-gs_output.gaussians.save_ply("out/output.ply")
-gs_output.mesh.export("out/output.obj")
+REPLICATE_API_TOKEN=r8_...
+GEMINI_API_KEY=AI...
 ```
 
 ---
 
-## CLI Arguments
+## VRAM notes
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--image` | *(required)* | Input image path (jpg, png, avif, webp, …) |
-| `--vlm_prompt` | `None` | InstructPix2Pix edit instruction |
-| `--vlm_img_guidance` | `1.5` | Image guidance scale (higher = preserve more structure) |
-| `--vlm_guidance` | `7.5` | Text guidance scale (higher = stronger edit) |
-| `--seed` | `42` | RNG seed |
-| `--foreground_ratio` | `0.825` | Foreground crop ratio |
-| `--output_dir` | `debug/edit` | Output directory |
-| `--device` | `cuda:0` | Torch device |
-| `--no_mesh` | `False` | Skip mesh extraction (faster) |
-
----
-
-## InstructPix2Pix Parameters
-
-- **`vlm_img_guidance`** (1.0–3.0): how closely the edit preserves the original structure. Higher = more shape preserved.
-- **`vlm_guidance`** (3–15): how strongly the text instruction is followed. Higher = stronger appearance change.
-
-Typical starting point: `--vlm_img_guidance 1.5 --vlm_guidance 7.5`
+- DiT transformer uses `xformers.memory_efficient_attention` (chunked)
+- `dual_call` runs under `@torch.no_grad()` — no gradient graph retained
+- WSL2: VRAM overflow silently spills to system RAM → very slow (18 min/step
+  observed). Run on native Linux with sufficient VRAM to avoid this.
+- Server target: single GPU with ≥16 GB VRAM recommended
